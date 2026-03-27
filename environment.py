@@ -38,6 +38,35 @@ class Direction(Enum):
             Direction.NONE: Direction.NONE,
         }[self]
 
+    def turn_left(self):
+        return {
+            Direction.UP: Direction.LEFT,
+            Direction.LEFT: Direction.DOWN,
+            Direction.DOWN: Direction.RIGHT,
+            Direction.RIGHT: Direction.UP,
+            Direction.NONE: Direction.NONE,
+        }[self]
+
+    def turn_right(self):
+        return {
+            Direction.UP: Direction.RIGHT,
+            Direction.RIGHT: Direction.DOWN,
+            Direction.DOWN: Direction.LEFT,
+            Direction.LEFT: Direction.UP,
+            Direction.NONE: Direction.NONE,
+        }[self]
+
+
+class Action(Enum):
+    """
+    The agent's action space. It can only move forward or turn.
+    No backward movement — that only happens involuntarily via pain reflex.
+    """
+    FORWARD = auto()
+    TURN_LEFT = auto()
+    TURN_RIGHT = auto()
+    NONE = auto()
+
 
 class CellType(Enum):
     EMPTY = 0
@@ -100,9 +129,75 @@ class Ghost(Entity):
 
 
 @dataclass
+class FearState:
+    """
+    Fear is not pre-programmed. It emerges from having been hurt.
+
+    Before first pain: the agent is naive. Ghosts are just objects.
+    After first pain: the agent develops an aversion to moving toward
+    known threats. This manifests as motor resistance — it becomes
+    physically harder to move forward when a threat is visible ahead.
+
+    Fear resistance scales with proximity:
+    - At max vision range: 25% resistance (75% effective power)
+    - At distance 1: ~90% resistance (nearly frozen)
+    - This is not a decision. It's a force acting on the body.
+    """
+    has_been_hurt: bool = False          # Naive until first pain
+    pain_count: int = 0                  # Cumulative pain experiences
+    last_pain_tick: int = -1             # When was the last pain
+    fear_intensity: float = 0.0          # 0.0 = no fear, 1.0 = maximum
+    # Fear intensity builds with pain and decays slowly over time
+
+    def register_pain(self, tick: int):
+        """Pain happened. Fear intensifies."""
+        self.has_been_hurt = True
+        self.pain_count += 1
+        self.last_pain_tick = tick
+        # Each pain experience increases base fear, diminishing returns
+        self.fear_intensity = min(1.0, self.fear_intensity + 0.3)
+
+    def decay(self, tick: int):
+        """Fear decays very slowly over time without pain."""
+        if self.last_pain_tick >= 0:
+            ticks_since_pain = tick - self.last_pain_tick
+            # Slow decay — fear lingers
+            decay_amount = 0.001 * ticks_since_pain * 0.01
+            self.fear_intensity = max(0.0, self.fear_intensity - decay_amount)
+
+    def get_resistance(self, distance_to_threat: int,
+                       max_vision: int = 15) -> float:
+        """
+        Calculate motor resistance when moving toward a visible threat.
+        Returns 0.0 (no resistance) to 1.0 (immovable).
+
+        Only applies if the agent has been hurt before.
+        """
+        if not self.has_been_hurt or distance_to_threat <= 0:
+            return 0.0
+
+        # Normalize distance: 1.0 at max range, 0.0 at distance 1
+        distance_factor = max(0.0, (distance_to_threat - 1)) / max(1, max_vision - 1)
+
+        # Base resistance: 0.25 at max range, 0.90 at distance 1
+        base_resistance = 0.90 - (0.65 * distance_factor)
+
+        # Scale by fear intensity (which builds with pain experiences)
+        return base_resistance * self.fear_intensity
+
+
+@dataclass
 class PacMan(Entity):
-    """The avatar — localization point for consciousness."""
+    """
+    The avatar — localization point for consciousness.
+
+    Movement model: forward and turn only.
+    - FORWARD: move one cell in facing direction
+    - TURN_LEFT / TURN_RIGHT: rotate 90 degrees, no movement
+    - Backward movement only occurs involuntarily via pain reflex
+    """
     degradation: DegradationState = field(default_factory=DegradationState)
+    fear: FearState = field(default_factory=FearState)
     involuntary_move: Optional[Direction] = None  # Pain reflex
     involuntary_timer: int = 0  # Ticks of lost control
     powered_up: bool = False
@@ -249,38 +344,52 @@ class Environment:
 
     def _apply_pain_reflex(self, ghost: Ghost):
         """
-        Ghost contact: seize motor control, push avatar away,
-        and degrade cognitive systems. This is the reflex arc.
+        Ghost contact: push the avatar BACKWARD (opposite of facing),
+        seize motor control, and degrade cognitive systems.
+
+        This is the reflex arc. The agent gets repelled as if it
+        walked backward — something it can never do voluntarily.
+        The backward push is involuntary proof that something
+        has violated the agent's bodily boundary.
         """
-        # Calculate push direction — away from ghost
-        dx = self.pacman.x - ghost.x
-        dy = self.pacman.y - ghost.y
-
-        # Determine primary push direction
-        if abs(dx) >= abs(dy):
-            push_dir = Direction.RIGHT if dx >= 0 else Direction.LEFT
+        # Push direction is OPPOSITE of facing — recoil from what's ahead
+        if self.pacman.direction == Direction.NONE:
+            # Not facing anywhere — push away from ghost
+            dx = self.pacman.x - ghost.x
+            dy = self.pacman.y - ghost.y
+            if abs(dx) >= abs(dy):
+                push_dir = Direction.RIGHT if dx >= 0 else Direction.LEFT
+            else:
+                push_dir = Direction.DOWN if dy >= 0 else Direction.UP
         else:
-            push_dir = Direction.DOWN if dy >= 0 else Direction.UP
+            push_dir = self.pacman.direction.opposite()
 
-        # Try to push; if blocked, try perpendicular directions
+        # Try to push backward; if blocked, try perpendicular
         push_options = [push_dir]
-        if push_dir in (Direction.LEFT, Direction.RIGHT):
-            push_options.extend([Direction.UP, Direction.DOWN])
-        else:
-            push_options.extend([Direction.LEFT, Direction.RIGHT])
+        perp_left = push_dir.turn_left()
+        perp_right = push_dir.turn_right()
+        push_options.extend([perp_left, perp_right])
 
         pushed = False
+        original_facing = self.pacman.direction  # Remember where we were looking
         for d in push_options:
             pdx, pdy = d.to_delta()
             if self.maze.is_walkable(self.pacman.x + pdx, self.pacman.y + pdy):
                 self.pacman.involuntary_move = d
                 self.pacman.involuntary_timer = 3  # Ticks of lost control
                 self._move_entity(self.pacman, d)
+                # Restore facing — the agent is still looking where it was.
+                # The body was thrown backward but the eyes stay fixed
+                # on the source of pain.
+                self.pacman.direction = original_facing
                 pushed = True
                 break
 
-        # Apply structural damage regardless of push success
+        # Apply structural damage
         self.pacman.degradation.apply_damage(0.15)
+
+        # Register pain in fear system
+        self.pacman.fear.register_pain(self.tick_count)
 
         # Log the pain event for sensor readout
         self.pain_events.append({
@@ -288,6 +397,7 @@ class Environment:
             'ghost': ghost.name,
             'severity': 0.15,
             'pushed': pushed,
+            'push_direction': push_dir.name if pushed else None,
         })
 
         # Check for death
@@ -373,9 +483,41 @@ class Environment:
                 ghost.scared = True
                 ghost.scared_timer = self.POWER_UP_DURATION
 
-    def step(self, agent_direction: Direction) -> dict:
+    def _get_threat_ahead_distance(self) -> Optional[int]:
+        """
+        Check if there's a visible threat in the forward direction.
+        Returns distance to nearest threat, or None if no threat visible.
+        """
+        if self.pacman.direction == Direction.NONE:
+            return None
+
+        vision = self._raycast(
+            self.pacman.x, self.pacman.y, self.pacman.direction
+        )
+        for entry in vision:
+            for c in entry['contents']:
+                if c.startswith('ghost:') and ':dangerous' in c:
+                    return entry['distance']
+            if 'wall' in entry['contents'] or 'boundary' in entry['contents']:
+                break
+        return None
+
+    def step(self, action: Action) -> dict:
         """
         Advance the world by one tick.
+
+        Action space:
+        - FORWARD: move one cell in facing direction
+        - TURN_LEFT: rotate 90° counterclockwise
+        - TURN_RIGHT: rotate 90° clockwise
+        - NONE: do nothing
+
+        Fear mechanics:
+        - If agent has been hurt and a threat is visible ahead,
+          FORWARD may fail due to fear resistance.
+        - Resistance increases as the threat gets closer.
+        - This is involuntary — the body resists, not the mind.
+
         Returns the sensor data for the consciousness layer.
         """
         if self.game_over:
@@ -384,24 +526,61 @@ class Environment:
         self.tick_count += 1
         self.pain_events = []
 
+        # Decay fear slightly each tick
+        self.pacman.fear.decay(self.tick_count)
+
         # --- Motor control ---
         # If pain reflex is active, agent loses control
         if self.pacman.involuntary_timer > 0:
             self.pacman.involuntary_timer -= 1
-            # Agent's intended direction is overridden
+            # Agent's intended action is overridden — body is recoiling
             if self.pacman.involuntary_move:
+                # Continue recoiling in push direction
+                original_facing = self.pacman.direction
                 self._move_entity(self.pacman, self.pacman.involuntary_move)
+                # Maintain original facing — agent is still looking
+                # at where the pain came from
+                self.pacman.direction = original_facing
         else:
             self.pacman.involuntary_move = None
-            # Apply motor impairment — chance of wrong direction
-            if (self.pacman.degradation.motor_impairment > 0 and
-                    random.random() < self.pacman.degradation.motor_impairment * 0.5):
-                valid = self.get_valid_moves(self.pacman.x, self.pacman.y)
-                if valid:
-                    agent_direction = random.choice(valid)
-            self._move_entity(self.pacman, agent_direction)
 
-        # Check pellet at new position
+            # Process agent action
+            if action == Action.TURN_LEFT:
+                self.pacman.direction = self.pacman.direction.turn_left()
+
+            elif action == Action.TURN_RIGHT:
+                self.pacman.direction = self.pacman.direction.turn_right()
+
+            elif action == Action.FORWARD:
+                moved = False
+
+                # Check fear resistance before moving forward
+                threat_dist = self._get_threat_ahead_distance()
+                fear_blocked = False
+
+                if threat_dist is not None:
+                    resistance = self.pacman.fear.get_resistance(threat_dist)
+                    if resistance > 0 and random.random() < resistance:
+                        # Fear wins — body refuses to move forward
+                        fear_blocked = True
+
+                # Apply motor impairment on top of fear
+                if not fear_blocked:
+                    if (self.pacman.degradation.motor_impairment > 0 and
+                            random.random() < self.pacman.degradation.motor_impairment * 0.5):
+                        # Motor damage — move in random valid direction
+                        valid = self.get_valid_moves(self.pacman.x, self.pacman.y)
+                        if valid:
+                            self._move_entity(self.pacman, random.choice(valid))
+                            moved = True
+                    else:
+                        moved = self._move_entity(
+                            self.pacman, self.pacman.direction
+                        )
+
+            # NONE: do nothing, just stand
+
+        # Check pellet at current position
         self._check_pellet()
 
         # Move ghosts (every other tick to make them slightly slower)
@@ -610,6 +789,16 @@ class Environment:
 
             # Pain channel
             'pain_events': self.pain_events,
+
+            # Fear channel — emergent from pain history
+            'has_been_hurt': self.pacman.fear.has_been_hurt,
+            'fear_intensity': self.pacman.fear.fear_intensity,
+            'pain_count': self.pacman.fear.pain_count,
+            'fear_resistance_ahead': (
+                self.pacman.fear.get_resistance(
+                    self._get_threat_ahead_distance() or 999
+                ) if self.pacman.fear.has_been_hurt else 0.0
+            ),
 
             # World state
             'tick': self.tick_count,

@@ -5,7 +5,7 @@ Also handles keyboard input for manual play / testing.
 
 import pygame
 import sys
-from environment import Environment, Direction, CellType
+from environment import Environment, Direction, Action, CellType
 
 
 # Colors
@@ -247,6 +247,45 @@ class Renderer:
             self.screen.blit(ctrl_text, (panel_x, y))
         y += 25
 
+        # Fear state
+        fear = self.env.pacman.fear
+        if fear.has_been_hurt:
+            fear_label = self.font.render("FEAR", True, (200, 100, 255))
+            self.screen.blit(fear_label, (panel_x, y))
+            y += 18
+
+            # Fear intensity bar
+            pygame.draw.rect(self.screen, (40, 40, 40),
+                             (panel_x, y, bar_width, 10))
+            fear_color = (
+                int(100 + 155 * fear.fear_intensity),
+                int(50 * (1 - fear.fear_intensity)),
+                int(255 * (1 - fear.fear_intensity * 0.5))
+            )
+            pygame.draw.rect(self.screen, fear_color,
+                             (panel_x, y, int(bar_width * fear.fear_intensity), 10))
+            y += 14
+
+            hurt_text = self.font.render(
+                f"Hurt {fear.pain_count}x", True, (200, 100, 255))
+            self.screen.blit(hurt_text, (panel_x, y))
+            y += 16
+
+            # Forward resistance
+            threat_dist = self.env._get_threat_ahead_distance()
+            if threat_dist is not None:
+                resistance = fear.get_resistance(threat_dist)
+                res_text = self.font.render(
+                    f"Fwd resist: {resistance:.0%}", True, RED)
+                self.screen.blit(res_text, (panel_x, y))
+                y += 16
+        else:
+            naive_text = self.font.render("NAIVE (no fear)", True, (100, 100, 100))
+            self.screen.blit(naive_text, (panel_x, y))
+            y += 18
+
+        y += 8
+
         # Stats
         stats = [
             f"Tick: {self.env.tick_count}",
@@ -356,18 +395,16 @@ class Renderer:
         self.power_pellet_frame += 1
         pygame.display.flip()
 
-    def get_input(self) -> Direction:
-        """Get keyboard direction input."""
+    def get_input(self) -> Action:
+        """Get keyboard input mapped to actions: forward, turn left, turn right."""
         keys = pygame.key.get_pressed()
         if keys[pygame.K_UP] or keys[pygame.K_w]:
-            return Direction.UP
-        if keys[pygame.K_DOWN] or keys[pygame.K_s]:
-            return Direction.DOWN
+            return Action.FORWARD
         if keys[pygame.K_LEFT] or keys[pygame.K_a]:
-            return Direction.LEFT
+            return Action.TURN_LEFT
         if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
-            return Direction.RIGHT
-        return Direction.NONE
+            return Action.TURN_RIGHT
+        return Action.NONE
 
     def handle_events(self) -> bool:
         """Process pygame events. Returns False if should quit."""
@@ -394,23 +431,28 @@ def main():
     env = Environment()
     renderer = Renderer(env)
 
+    # Give pacman an initial facing direction
+    env.pacman.direction = Direction.UP
+
     print("=== PAC-MAN CONSCIOUSNESS ENVIRONMENT ===")
-    print("Arrow keys / WASD to move")
+    print("UP / W    — move forward")
+    print("LEFT / A  — turn left")
+    print("RIGHT / D — turn right")
     print("R to reset, ESC to quit")
-    print("Watch the health panel — ghost contact degrades your systems.")
+    print()
+    print("You can only move FORWARD or TURN.")
+    print("Backward movement only happens involuntarily from pain.")
+    print("Fear emerges after your first ghost contact.")
     print()
 
     running = True
-    last_direction = Direction.NONE
 
     while running:
         running = renderer.handle_events()
 
-        direction = renderer.get_input()
-        if direction != Direction.NONE:
-            last_direction = direction
+        action = renderer.get_input()
 
-        sensors = env.step(last_direction)
+        sensors = env.step(action)
 
         renderer.draw()
         renderer.tick()

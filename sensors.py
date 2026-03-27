@@ -47,6 +47,20 @@ class PainChannel:
 
 
 @dataclass
+class FearChannel:
+    """
+    Am I afraid? Fear is not innate — it emerges from having been hurt.
+    Before first pain, this channel is silent. After pain, it reports
+    the body's resistance to moving toward known threats.
+    """
+    has_been_hurt: bool          # Has the agent ever experienced pain?
+    fear_intensity: float        # 0.0 = calm, 1.0 = terrified
+    pain_count: int              # How many times has the agent been hurt?
+    resistance_ahead: float      # Current motor resistance to moving forward
+                                 # 0.0 = no resistance, 1.0 = frozen
+
+
+@dataclass
 class VisionObject:
     """Something seen along the line of sight."""
     distance: int
@@ -99,6 +113,7 @@ class SensorReadout:
     proprioception: ProprioceptionChannel
     somatic: SomaticChannel
     pain: PainChannel
+    fear: FearChannel
     vision: VisionChannel
     touch: TouchChannel
     pellets_remaining: int
@@ -138,7 +153,19 @@ class SensorReadout:
             lines.append(f"\n!! PAIN: Contact with {self.pain.pain_source}, "
                          f"severity {self.pain.severity:.0%}")
             if self.pain.was_pushed:
-                lines.append("  Body was involuntarily pushed away from source")
+                lines.append("  Body was involuntarily pushed backward")
+
+        # Fear
+        f = self.fear
+        if f.has_been_hurt:
+            lines.append(f"\nFEAR:")
+            lines.append(f"  Intensity: {f.fear_intensity:.0%} "
+                         f"(hurt {f.pain_count} time{'s' if f.pain_count != 1 else ''})")
+            if f.resistance_ahead > 0:
+                lines.append(f"  !! Forward resistance: {f.resistance_ahead:.0%} "
+                             f"— body resisting movement toward threat !!")
+            elif f.fear_intensity > 0:
+                lines.append(f"  No threat ahead — fear dormant")
 
         # Vision
         v = self.vision
@@ -223,6 +250,14 @@ class SensorInterface:
                 severity=0.0,
                 was_pushed=False,
             )
+
+        # Fear
+        fear = FearChannel(
+            has_been_hurt=raw_sensors['has_been_hurt'],
+            fear_intensity=raw_sensors['fear_intensity'],
+            pain_count=raw_sensors['pain_count'],
+            resistance_ahead=raw_sensors['fear_resistance_ahead'],
+        )
 
         # Vision
         vision_objects = [
@@ -310,6 +345,7 @@ class SensorInterface:
             proprioception=proprioception,
             somatic=somatic,
             pain=pain,
+            fear=fear,
             vision=vision,
             touch=touch,
             pellets_remaining=raw_sensors['pellets_remaining'],
